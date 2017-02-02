@@ -120,10 +120,12 @@
 #include "ConvertUTF.h"
 
 #include <string>
+#include <deque>
 #include <vector>
 #include <memory>
 
 using std::string;
+using std::deque;
 using std::vector;
 using std::unique_ptr;
 using namespace linenoise_ng;
@@ -517,6 +519,10 @@ struct linenoiseCompletions {
   vector<Utf32String> completionStrings;
 };
 
+struct linenoiseKeyQueue {
+  deque<char32_t> queue;
+};
+
 #define LINENOISE_DEFAULT_HISTORY_MAX_LEN 100
 #define LINENOISE_MAX_LINE 4096
 
@@ -861,58 +867,13 @@ class InputBuffer {
     len = static_cast<int>(ucharCount);
     pos = static_cast<int>(ucharCount);
   }
-  int getInputLine(PromptBase& pi);
+  int getInputLine(PromptBase& pi, bool displayEmpty);
   int length(void) const { return len; }
 };
 
-// Special codes for keyboard input:
-//
-// Between Windows and the various Linux "terminal" programs, there is some
-// pretty diverse behavior in the "scan codes" and escape sequences we are
-// presented with.  So ... we'll translate them all into our own pidgin
-// pseudocode, trying to stay out of the way of UTF-8 and international
-// characters.  Here's the general plan.
-//
-// "User input keystrokes" (key chords, whatever) will be encoded as a single
-// value.
-// The low 21 bits are reserved for Unicode characters.  Popular function-type
-// keys
-// get their own codes in the range 0x10200000 to (if needed) 0x1FE00000,
-// currently
-// just arrow keys, Home, End and Delete.  Keypresses with Ctrl get ORed with
-// 0x20000000, with Alt get ORed with 0x40000000.  So, Ctrl+Alt+Home is encoded
-// as 0x20000000 + 0x40000000 + 0x10A00000 == 0x70A00000.  To keep things
-// complicated,
-// the Alt key is equivalent to prefixing the keystroke with ESC, so ESC
-// followed by
-// D is treated the same as Alt + D ... we'll just use Emacs terminology and
-// call
-// this "Meta".  So, we will encode both ESC followed by D and Alt held down
-// while D
-// is pressed the same, as Meta-D, encoded as 0x40000064.
-//
-// Here are the definitions of our component constants:
-//
-// Maximum unsigned 32-bit value    = 0xFFFFFFFF;   // For reference, max 32-bit
-// value
-// Highest allocated Unicode char   = 0x001FFFFF;   // For reference, max
-// Unicode value
-static const int META = 0x40000000;  // Meta key combination
-static const int CTRL = 0x20000000;  // Ctrl key combination
-// static const int SPECIAL_KEY = 0x10000000;   // Common bit for all special
-// keys
-static const int UP_ARROW_KEY = 0x10200000;  // Special keys
-static const int DOWN_ARROW_KEY = 0x10400000;
-static const int RIGHT_ARROW_KEY = 0x10600000;
-static const int LEFT_ARROW_KEY = 0x10800000;
-static const int HOME_KEY = 0x10A00000;
-static const int END_KEY = 0x10C00000;
-static const int DELETE_KEY = 0x10E00000;
-static const int PAGE_UP_KEY = 0x11000000;
-static const int PAGE_DOWN_KEY = 0x11200000;
-
 static const char* unsupported_term[] = {"dumb", "cons25", "emacs", NULL};
 static linenoiseCompletionCallback* completionCallback = NULL;
+static linenoiseKeyCallback* keyCallback = NULL;
 
 #ifdef _WIN32
 static HANDLE console_in, console_out;
@@ -1190,18 +1151,32 @@ static void dynamicRefresh(PromptBase& pi, char32_t* buf32, int len, int pos) {
  */
 void InputBuffer::refreshLine(PromptBase& pi) {
   // check for a matching brace/bracket/paren, remember its position if found
-  int highlight = -1;
-  if (pos < len) {
-    /* this scans for a brace matching buf32[pos] to highlight */
+  int highlightStart = -1;
+  int highlightEnd = -1;
+
+  {
+    /* this scans for a brace matching buf32[pos] or buf32[pos - 1] to highlight */
+    int scanBase = pos;
     int scanDirection = 0;
-    if (strchr("}])", buf32[pos]))
+    if (pos < len && strchr("}])", buf32[pos])) {
+      highlightStart = scanBase;
       scanDirection = -1; /* backwards */
-    else if (strchr("{[(", buf32[pos]))
+    } else if (pos && strchr("}])", buf32[pos - 1])) {
+      scanBase -= 1;
+      highlightStart = scanBase;
+      scanDirection = -1; /* backwards */
+    } else if (pos < len && strchr("{[(", buf32[pos])) {
+      highlightStart = scanBase;
       scanDirection = 1; /* forwards */
+    } else if (pos && strchr("{[(", buf32[pos - 1])) {
+      scanBase -= 1;
+      highlightStart = scanBase;
+      scanDirection = 1; /* forwards */
+    }
 
     if (scanDirection) {
       int unmatched = scanDirection;
-      for (int i = pos + scanDirection; i >= 0 && i < len; i += scanDirection) {
+      for (int i = scanBase + scanDirection; i >= 0 && i < len; i += scanDirection) {
         /* TODO: the right thing when inside a string */
         if (strchr("}])", buf32[i]))
           --unmatched;
@@ -1209,11 +1184,16 @@ void InputBuffer::refreshLine(PromptBase& pi) {
           ++unmatched;
 
         if (unmatched == 0) {
-          highlight = i;
+          // Sort start and end positions
+          highlightEnd = i >= highlightStart ? i : highlightStart;
+          highlightStart = i >= highlightStart ? highlightStart : i;
           break;
         }
       }
     }
+
+    if (highlightStart == -1 || highlightEnd == -1)
+      highlightStart = highlightEnd = -1;
   }
 
   // calculate the position of the end of the input line
@@ -1242,14 +1222,22 @@ void InputBuffer::refreshLine(PromptBase& pi) {
   pi.promptPreviousInputLen = len;
 
   // display the input line
-  if (highlight == -1) {
+  if (highlightStart == -1) {
     if (write32(1, buf32, len) == -1) return;
   } else {
-    if (write32(1, buf32, highlight) == -1) return;
+    if (write32(1, buf32, highlightStart) == -1) return;
+
     setDisplayAttribute(true); /* bright blue (visible with both B&W bg) */
-    if (write32(1, &buf32[highlight], 1) == -1) return;
+    if (write32(1, &buf32[highlightStart], 1) == -1) return;
     setDisplayAttribute(false);
-    if (write32(1, buf32 + highlight + 1, len - highlight - 1) == -1) return;
+
+    if (write32(1, buf32 + highlightStart + 1, highlightEnd - highlightStart - 1) == -1) return;
+
+    setDisplayAttribute(true); /* bright blue (visible with both B&W bg) */
+    if (write32(1, &buf32[highlightEnd], 1) == -1) return;
+    setDisplayAttribute(false);
+
+    if (write32(1, buf32 + highlightEnd + 1, len - highlightEnd - 1) == -1) return;
   }
 
   // position the cursor
@@ -1269,14 +1257,22 @@ void InputBuffer::refreshLine(PromptBase& pi) {
            pi.promptIndentation + 1);  // 1-based on VT100
   if (write(1, seq, strlen(seq)) == -1) return;
 
-  if (highlight == -1) {  // write unhighlighted text
+  if (highlightStart == -1) {
     if (write32(1, buf32, len) == -1) return;
-  } else {  // highlight the matching brace/bracket/parenthesis
-    if (write32(1, buf32, highlight) == -1) return;
-    setDisplayAttribute(true);
-    if (write32(1, &buf32[highlight], 1) == -1) return;
+  } else {
+    if (write32(1, buf32, highlightStart) == -1) return;
+
+    setDisplayAttribute(true); /* bright blue (visible with both B&W bg) */
+    if (write32(1, &buf32[highlightStart], 1) == -1) return;
     setDisplayAttribute(false);
-    if (write32(1, buf32 + highlight + 1, len - highlight - 1) == -1) return;
+
+    if (write32(1, buf32 + highlightStart + 1, highlightEnd - highlightStart - 1) == -1) return;
+
+    setDisplayAttribute(true); /* bright blue (visible with both B&W bg) */
+    if (write32(1, &buf32[highlightEnd], 1) == -1) return;
+    setDisplayAttribute(false);
+
+    if (write32(1, buf32 + highlightEnd + 1, len - highlightEnd - 1) == -1) return;
   }
 
   // we have to generate our own newline on line wrap
@@ -1419,42 +1415,42 @@ static char32_t thisKeyMetaCtrl =
 //
 static char32_t normalKeyRoutine(char32_t c) { return thisKeyMetaCtrl | c; }
 static char32_t upArrowKeyRoutine(char32_t) {
-  return thisKeyMetaCtrl | UP_ARROW_KEY;
+  return thisKeyMetaCtrl | LINENOISE_UP_ARROW_KEY;
 }
 static char32_t downArrowKeyRoutine(char32_t) {
-  return thisKeyMetaCtrl | DOWN_ARROW_KEY;
+  return thisKeyMetaCtrl | LINENOISE_DOWN_ARROW_KEY;
 }
 static char32_t rightArrowKeyRoutine(char32_t) {
-  return thisKeyMetaCtrl | RIGHT_ARROW_KEY;
+  return thisKeyMetaCtrl | LINENOISE_RIGHT_ARROW_KEY;
 }
 static char32_t leftArrowKeyRoutine(char32_t) {
-  return thisKeyMetaCtrl | LEFT_ARROW_KEY;
+  return thisKeyMetaCtrl | LINENOISE_LEFT_ARROW_KEY;
 }
-static char32_t homeKeyRoutine(char32_t) { return thisKeyMetaCtrl | HOME_KEY; }
-static char32_t endKeyRoutine(char32_t) { return thisKeyMetaCtrl | END_KEY; }
+static char32_t homeKeyRoutine(char32_t) { return thisKeyMetaCtrl | LINENOISE_HOME_KEY; }
+static char32_t endKeyRoutine(char32_t) { return thisKeyMetaCtrl | LINENOISE_END_KEY; }
 static char32_t pageUpKeyRoutine(char32_t) {
-  return thisKeyMetaCtrl | PAGE_UP_KEY;
+  return thisKeyMetaCtrl | LINENOISE_PAGE_UP_KEY;
 }
 static char32_t pageDownKeyRoutine(char32_t) {
-  return thisKeyMetaCtrl | PAGE_DOWN_KEY;
+  return thisKeyMetaCtrl | LINENOISE_PAGE_DOWN_KEY;
 }
 static char32_t deleteCharRoutine(char32_t) {
   return thisKeyMetaCtrl | ctrlChar('H');
 }  // key labeled Backspace
 static char32_t deleteKeyRoutine(char32_t) {
-  return thisKeyMetaCtrl | DELETE_KEY;
+  return thisKeyMetaCtrl | LINENOISE_DELETE_KEY;
 }  // key labeled Delete
 static char32_t ctrlUpArrowKeyRoutine(char32_t) {
-  return thisKeyMetaCtrl | CTRL | UP_ARROW_KEY;
+  return thisKeyMetaCtrl | LINENOISE_CTRL | LINENOISE_UP_ARROW_KEY;
 }
 static char32_t ctrlDownArrowKeyRoutine(char32_t) {
-  return thisKeyMetaCtrl | CTRL | DOWN_ARROW_KEY;
+  return thisKeyMetaCtrl | LINENOISE_CTRL | LINENOISE_DOWN_ARROW_KEY;
 }
 static char32_t ctrlRightArrowKeyRoutine(char32_t) {
-  return thisKeyMetaCtrl | CTRL | RIGHT_ARROW_KEY;
+  return thisKeyMetaCtrl | LINENOISE_CTRL | LINENOISE_RIGHT_ARROW_KEY;
 }
 static char32_t ctrlLeftArrowKeyRoutine(char32_t) {
-  return thisKeyMetaCtrl | CTRL | LEFT_ARROW_KEY;
+  return thisKeyMetaCtrl | LINENOISE_CTRL | LINENOISE_LEFT_ARROW_KEY;
 }
 static char32_t escFailureRoutine(char32_t) {
   beep();
@@ -1474,13 +1470,13 @@ static CharacterDispatch escLeftBracket1Semicolon3or5Dispatch = {
 static char32_t escLeftBracket1Semicolon3Routine(char32_t c) {
   c = readUnicodeCharacter();
   if (c == 0) return 0;
-  thisKeyMetaCtrl |= META;
+  thisKeyMetaCtrl |= LINENOISE_META;
   return doDispatch(c, escLeftBracket1Semicolon3or5Dispatch);
 }
 static char32_t escLeftBracket1Semicolon5Routine(char32_t c) {
   c = readUnicodeCharacter();
   if (c == 0) return 0;
-  thisKeyMetaCtrl |= CTRL;
+  thisKeyMetaCtrl |= LINENOISE_CTRL;
   return doDispatch(c, escLeftBracket1Semicolon3or5Dispatch);
 }
 static CharacterDispatchRoutine escLeftBracket1SemicolonRoutines[] = {
@@ -1643,7 +1639,7 @@ static CharacterDispatch initialDispatch = {2, "\x1B\x7F", initialRoutines};
 // Special handling for the ESC key because it does double duty
 //
 static char32_t setMetaRoutine(char32_t c) {
-  thisKeyMetaCtrl = META;
+  thisKeyMetaCtrl = LINENOISE_META;
   if (c == 0x1B) {  // another ESC, stay in ESC processing mode
     c = readUnicodeCharacter();
     if (c == 0) return 0;
@@ -1731,35 +1727,35 @@ static char32_t linenoiseReadChar(void) {
     }
     if (rec.Event.KeyEvent.dwControlKeyState &
         (RIGHT_CTRL_PRESSED | LEFT_CTRL_PRESSED)) {
-      modifierKeys |= CTRL;
+      modifierKeys |= LINENOISE_CTRL;
     }
     if (rec.Event.KeyEvent.dwControlKeyState &
         (RIGHT_ALT_PRESSED | LEFT_ALT_PRESSED)) {
-      modifierKeys |= META;
+      modifierKeys |= LINENOISE_META;
     }
     if (escSeen) {
-      modifierKeys |= META;
+      modifierKeys |= LINENOISE_META;
     }
     if (rec.Event.KeyEvent.uChar.UnicodeChar == 0) {
       switch (rec.Event.KeyEvent.wVirtualKeyCode) {
         case VK_LEFT:
-          return modifierKeys | LEFT_ARROW_KEY;
+          return modifierKeys | LINENOISE_LEFT_ARROW_KEY;
         case VK_RIGHT:
-          return modifierKeys | RIGHT_ARROW_KEY;
+          return modifierKeys | LINENOISE_RIGHT_ARROW_KEY;
         case VK_UP:
-          return modifierKeys | UP_ARROW_KEY;
+          return modifierKeys | LINENOISE_UP_ARROW_KEY;
         case VK_DOWN:
-          return modifierKeys | DOWN_ARROW_KEY;
+          return modifierKeys | LINENOISE_DOWN_ARROW_KEY;
         case VK_DELETE:
-          return modifierKeys | DELETE_KEY;
+          return modifierKeys | LINENOISE_DELETE_KEY;
         case VK_HOME:
-          return modifierKeys | HOME_KEY;
+          return modifierKeys | LINENOISE_HOME_KEY;
         case VK_END:
-          return modifierKeys | END_KEY;
+          return modifierKeys | LINENOISE_END_KEY;
         case VK_PRIOR:
-          return modifierKeys | PAGE_UP_KEY;
+          return modifierKeys | LINENOISE_PAGE_UP_KEY;
         case VK_NEXT:
-          return modifierKeys | PAGE_DOWN_KEY;
+          return modifierKeys | LINENOISE_PAGE_DOWN_KEY;
         default:
           continue;  // in raw mode, ReadConsoleInput shows shift, ctrl ...
       }              //  ... ignore them
@@ -1863,16 +1859,16 @@ static void freeCompletions(linenoiseCompletions* lc) {
  * @return cleaned-up character
  */
 static int cleanupCtrl(int c) {
-  if (c & CTRL) {
+  if (c & LINENOISE_CTRL) {
     int d = c & 0x1FF;
     if (d >= 'a' && d <= 'z') {
-      c = (c + ('a' - ctrlChar('A'))) & ~CTRL;
+      c = (c + ('a' - ctrlChar('A'))) & ~LINENOISE_CTRL;
     }
     if (d >= 'A' && d <= 'Z') {
-      c = (c + ('A' - ctrlChar('A'))) & ~CTRL;
+      c = (c + ('A' - ctrlChar('A'))) & ~LINENOISE_CTRL;
     }
     if (d >= ctrlChar('A') && d <= ctrlChar('Z')) {
-      c = c & ~CTRL;
+      c = c & ~LINENOISE_CTRL;
     }
   }
   return c;
@@ -1914,7 +1910,7 @@ int InputBuffer::completeLine(PromptBase& pi) {
   Utf8String parseItem(unicodeCopy);
 
   // get a list of completions
-  completionCallback(parseItem.get(), &lc);
+  completionCallback(parseItem.get(), { buf32, pos, len }, &lc);
 
   // if no completions, we are done
   if (lc.completionStrings.size() == 0) {
@@ -2205,44 +2201,44 @@ int InputBuffer::incrementalHistorySearch(PromptBase& pi, int startChar) {
     switch (c) {
       // these characters keep the selected text but do not execute it
       case ctrlChar('A'):  // ctrl-A, move cursor to start of line
-      case HOME_KEY:
+      case LINENOISE_HOME_KEY:
       case ctrlChar('B'):  // ctrl-B, move cursor left by one character
-      case LEFT_ARROW_KEY:
-      case META + 'b':  // meta-B, move cursor left by one word
-      case META + 'B':
-      case CTRL + LEFT_ARROW_KEY:
-      case META + LEFT_ARROW_KEY:  // Emacs allows Meta, bash & readline don't
+      case LINENOISE_LEFT_ARROW_KEY:
+      case LINENOISE_META + 'b':  // meta-B, move cursor left by one word
+      case LINENOISE_META + 'B':
+      case LINENOISE_CTRL + LINENOISE_LEFT_ARROW_KEY:
+      case LINENOISE_META + LINENOISE_LEFT_ARROW_KEY:  // Emacs allows Meta, bash & readline don't
       case ctrlChar('D'):
-      case META + 'd':  // meta-D, kill word to right of cursor
-      case META + 'D':
+      case LINENOISE_META + 'd':  // meta-D, kill word to right of cursor
+      case LINENOISE_META + 'D':
       case ctrlChar('E'):  // ctrl-E, move cursor to end of line
-      case END_KEY:
+      case LINENOISE_END_KEY:
       case ctrlChar('F'):  // ctrl-F, move cursor right by one character
-      case RIGHT_ARROW_KEY:
-      case META + 'f':  // meta-F, move cursor right by one word
-      case META + 'F':
-      case CTRL + RIGHT_ARROW_KEY:
-      case META + RIGHT_ARROW_KEY:  // Emacs allows Meta, bash & readline don't
-      case META + ctrlChar('H'):
+      case LINENOISE_RIGHT_ARROW_KEY:
+      case LINENOISE_META + 'f':  // meta-F, move cursor right by one word
+      case LINENOISE_META + 'F':
+      case LINENOISE_CTRL + LINENOISE_RIGHT_ARROW_KEY:
+      case LINENOISE_META + LINENOISE_RIGHT_ARROW_KEY:  // Emacs allows Meta, bash & readline don't
+      case LINENOISE_META + ctrlChar('H'):
       case ctrlChar('J'):
       case ctrlChar('K'):  // ctrl-K, kill from cursor to end of line
       case ctrlChar('M'):
       case ctrlChar('N'):  // ctrl-N, recall next line in history
       case ctrlChar('P'):  // ctrl-P, recall previous line in history
-      case DOWN_ARROW_KEY:
-      case UP_ARROW_KEY:
+      case LINENOISE_DOWN_ARROW_KEY:
+      case LINENOISE_UP_ARROW_KEY:
       case ctrlChar('T'):  // ctrl-T, transpose characters
       case ctrlChar(
           'U'):  // ctrl-U, kill all characters to the left of the cursor
       case ctrlChar('W'):
-      case META + 'y':  // meta-Y, "yank-pop", rotate popped text
-      case META + 'Y':
+      case LINENOISE_META + 'y':  // meta-Y, "yank-pop", rotate popped text
+      case LINENOISE_META + 'Y':
       case 127:
-      case DELETE_KEY:
-      case META + '<':  // start of history
-      case PAGE_UP_KEY:
-      case META + '>':  // end of history
-      case PAGE_DOWN_KEY:
+      case LINENOISE_DELETE_KEY:
+      case LINENOISE_META + '<':  // start of history
+      case LINENOISE_PAGE_UP_KEY:
+      case LINENOISE_META + '>':  // end of history
+      case LINENOISE_PAGE_DOWN_KEY:
         keepLooping = false;
         break;
 
@@ -2435,7 +2431,7 @@ static bool isCharacterAlphanumeric(char32_t testChar) {
 static bool gotResize = false;
 #endif
 
-int InputBuffer::getInputLine(PromptBase& pi) {
+int InputBuffer::getInputLine(PromptBase& pi, bool displayEmpty) {
   // The latest history entry is always our current buffer
   if (len > 0) {
     size_t bufferSize = sizeof(char32_t) * len + 1;
@@ -2449,13 +2445,15 @@ int InputBuffer::getInputLine(PromptBase& pi) {
   historyRecallMostRecent = false;
 
   // display the prompt
-  if (!pi.write()) return -1;
+  if (len > 0 || displayEmpty) {
+    if (!pi.write()) return -1;
 
 #ifndef _WIN32
-  // we have to generate our own newline on line wrap on Linux
-  if (pi.promptIndentation == 0 && pi.promptExtraLines > 0)
-    if (write(1, "\n", 1) == -1) return -1;
+    // we have to generate our own newline on line wrap on Linux
+    if (pi.promptIndentation == 0 && pi.promptExtraLines > 0)
+      if (write(1, "\n", 1) == -1) return -1;
 #endif
+  }
 
   // the cursor starts out at the end of the prompt
   pi.promptCursorRowOffset = pi.promptExtraLines;
@@ -2472,29 +2470,39 @@ int InputBuffer::getInputLine(PromptBase& pi) {
     refreshLine(pi);
   }
 
+  linenoiseKeyQueue queue;
+
   // loop collecting characters, respond to line editing characters
   while (true) {
     int c;
     if (terminatingKeystroke == -1) {
-      c = linenoiseReadChar();  // get a new keystroke
+      if (queue.queue.empty()) {
+        c = linenoiseReadChar();  // get a new keystroke
+
+        if (!len && !displayEmpty) {
+          displayEmpty = true;
+          dynamicRefresh(pi, buf32, len, pos);
+        }
 
 #ifndef _WIN32
-      if (c == 0 && gotResize) {
-        // caught a window resize event
-        // now redraw the prompt and line
-        gotResize = false;
-        pi.promptScreenColumns = getScreenColumns();
-        dynamicRefresh(pi, buf32, len,
-                       pos);  // redraw the original prompt with current input
-        continue;
-      }
+        if (c == 0 && gotResize) {
+          // caught a window resize event
+          // now redraw the prompt and line
+          gotResize = false;
+          pi.promptScreenColumns = getScreenColumns();
+          dynamicRefresh(pi, buf32, len,
+                         pos);  // redraw the original prompt with current input
+          continue;
+        }
 #endif
+      } else {
+        c = queue.queue.front(); // pop key from queue
+        queue.queue.pop_front();
+      }
     } else {
       c = terminatingKeystroke;   // use the terminating keystroke from search
       terminatingKeystroke = -1;  // clear it once we've used it
     }
-
-    c = cleanupCtrl(c);  // convert CTRL + <char> into normal ctrl
 
     if (c == 0) {
       return len;
@@ -2510,6 +2518,14 @@ int InputBuffer::getInputLine(PromptBase& pi) {
       refreshLine(pi);
       continue;
     }
+
+    if (keyCallback) {
+      if (keyCallback(c, { buf32, pos, len }, &queue)) {
+        continue;
+      }
+    }
+
+    c = cleanupCtrl(c);  // convert CTRL + <char> into normal ctrl
 
     // ctrl-I/tab, command completion, needs to be before switch statement
     if (c == ctrlChar('I') && completionCallback) {
@@ -2537,14 +2553,14 @@ int InputBuffer::getInputLine(PromptBase& pi) {
 
     switch (c) {
       case ctrlChar('A'):  // ctrl-A, move cursor to start of line
-      case HOME_KEY:
+      case LINENOISE_HOME_KEY:
         killRing.lastAction = KillRing::actionOther;
         pos = 0;
         refreshLine(pi);
         break;
 
       case ctrlChar('B'):  // ctrl-B, move cursor left by one character
-      case LEFT_ARROW_KEY:
+      case LINENOISE_LEFT_ARROW_KEY:
         killRing.lastAction = KillRing::actionOther;
         if (pos > 0) {
           --pos;
@@ -2552,10 +2568,10 @@ int InputBuffer::getInputLine(PromptBase& pi) {
         }
         break;
 
-      case META + 'b':  // meta-B, move cursor left by one word
-      case META + 'B':
-      case CTRL + LEFT_ARROW_KEY:
-      case META + LEFT_ARROW_KEY:  // Emacs allows Meta, bash & readline don't
+      case LINENOISE_META + 'b':  // meta-B, move cursor left by one word
+      case LINENOISE_META + 'B':
+      case LINENOISE_CTRL + LINENOISE_LEFT_ARROW_KEY:
+      case LINENOISE_META + LINENOISE_LEFT_ARROW_KEY:  // Emacs allows Meta, bash & readline don't
         killRing.lastAction = KillRing::actionOther;
         if (pos > 0) {
           while (pos > 0 && !isCharacterAlphanumeric(buf32[pos - 1])) {
@@ -2581,8 +2597,8 @@ int InputBuffer::getInputLine(PromptBase& pi) {
         if (write(1, "^C", 2) == -1) return -1;  // Display the ^C we got
         return -1;
 
-      case META + 'c':  // meta-C, give word initial Cap
-      case META + 'C':
+      case LINENOISE_META + 'c':  // meta-C, give word initial Cap
+      case LINENOISE_META + 'C':
         killRing.lastAction = KillRing::actionOther;
         historyRecallMostRecent = false;
         if (pos < len) {
@@ -2621,8 +2637,8 @@ int InputBuffer::getInputLine(PromptBase& pi) {
         }
         break;
 
-      case META + 'd':  // meta-D, kill word to right of cursor
-      case META + 'D':
+      case LINENOISE_META + 'd':  // meta-D, kill word to right of cursor
+      case LINENOISE_META + 'D':
         if (pos < len) {
           historyRecallMostRecent = false;
           int endingPos = pos;
@@ -2643,14 +2659,14 @@ int InputBuffer::getInputLine(PromptBase& pi) {
         break;
 
       case ctrlChar('E'):  // ctrl-E, move cursor to end of line
-      case END_KEY:
+      case LINENOISE_END_KEY:
         killRing.lastAction = KillRing::actionOther;
         pos = len;
         refreshLine(pi);
         break;
 
       case ctrlChar('F'):  // ctrl-F, move cursor right by one character
-      case RIGHT_ARROW_KEY:
+      case LINENOISE_RIGHT_ARROW_KEY:
         killRing.lastAction = KillRing::actionOther;
         if (pos < len) {
           ++pos;
@@ -2658,10 +2674,10 @@ int InputBuffer::getInputLine(PromptBase& pi) {
         }
         break;
 
-      case META + 'f':  // meta-F, move cursor right by one word
-      case META + 'F':
-      case CTRL + RIGHT_ARROW_KEY:
-      case META + RIGHT_ARROW_KEY:  // Emacs allows Meta, bash & readline don't
+      case LINENOISE_META + 'f':  // meta-F, move cursor right by one word
+      case LINENOISE_META + 'F':
+      case LINENOISE_CTRL + LINENOISE_RIGHT_ARROW_KEY:
+      case LINENOISE_META + LINENOISE_RIGHT_ARROW_KEY:  // Emacs allows Meta, bash & readline don't
         killRing.lastAction = KillRing::actionOther;
         if (pos < len) {
           while (pos < len && !isCharacterAlphanumeric(buf32[pos])) {
@@ -2687,7 +2703,7 @@ int InputBuffer::getInputLine(PromptBase& pi) {
         break;
 
       // meta-Backspace, kill word to left of cursor
-      case META + ctrlChar('H'):
+      case LINENOISE_META + ctrlChar('H'):
         if (pos > 0) {
           historyRecallMostRecent = false;
           int startingPos = pos;
@@ -2731,8 +2747,8 @@ int InputBuffer::getInputLine(PromptBase& pi) {
         clearScreen(pi);
         break;
 
-      case META + 'l':  // meta-L, lowercase word
-      case META + 'L':
+      case LINENOISE_META + 'l':  // meta-L, lowercase word
+      case LINENOISE_META + 'L':
         killRing.lastAction = KillRing::actionOther;
         if (pos < len) {
           historyRecallMostRecent = false;
@@ -2751,8 +2767,8 @@ int InputBuffer::getInputLine(PromptBase& pi) {
 
       case ctrlChar('N'):  // ctrl-N, recall next line in history
       case ctrlChar('P'):  // ctrl-P, recall previous line in history
-      case DOWN_ARROW_KEY:
-      case UP_ARROW_KEY:
+      case LINENOISE_DOWN_ARROW_KEY:
+      case LINENOISE_UP_ARROW_KEY:
         killRing.lastAction = KillRing::actionOther;
         // if not already recalling, add the current line to the history list so
         // we don't
@@ -2765,7 +2781,7 @@ int InputBuffer::getInputLine(PromptBase& pi) {
           history[historyLen - 1] = strdup8(tempBuffer.get());
         }
         if (historyLen > 1) {
-          if (c == UP_ARROW_KEY) {
+          if (c == LINENOISE_UP_ARROW_KEY) {
             c = ctrlChar('P');
           }
           if (historyPreviousIndex != -2 && c != ctrlChar('P')) {
@@ -2821,8 +2837,8 @@ int InputBuffer::getInputLine(PromptBase& pi) {
         killRing.lastAction = KillRing::actionKill;
         break;
 
-      case META + 'u':  // meta-U, uppercase word
-      case META + 'U':
+      case LINENOISE_META + 'u':  // meta-U, uppercase word
+      case LINENOISE_META + 'U':
         killRing.lastAction = KillRing::actionOther;
         if (pos < len) {
           historyRecallMostRecent = false;
@@ -2888,8 +2904,8 @@ int InputBuffer::getInputLine(PromptBase& pi) {
         }
         break;
 
-      case META + 'y':  // meta-Y, "yank-pop", rotate popped text
-      case META + 'Y':
+      case LINENOISE_META + 'y':  // meta-Y, "yank-pop", rotate popped text
+      case LINENOISE_META + 'Y':
         if (killRing.lastAction == KillRing::actionYank) {
           historyRecallMostRecent = false;
           Utf32String* restoredText = killRing.yankPop();
@@ -2938,7 +2954,7 @@ int InputBuffer::getInputLine(PromptBase& pi) {
 
       // DEL, delete the character under the cursor
       case 127:
-      case DELETE_KEY:
+      case LINENOISE_DELETE_KEY:
         killRing.lastAction = KillRing::actionOther;
         if (len > 0 && pos < len) {
           historyRecallMostRecent = false;
@@ -2948,10 +2964,10 @@ int InputBuffer::getInputLine(PromptBase& pi) {
         }
         break;
 
-      case META + '<':     // meta-<, beginning of history
-      case PAGE_UP_KEY:    // Page Up, beginning of history
-      case META + '>':     // meta->, end of history
-      case PAGE_DOWN_KEY:  // Page Down, end of history
+      case LINENOISE_META + '<':     // meta-<, beginning of history
+      case LINENOISE_PAGE_UP_KEY:    // Page Up, beginning of history
+      case LINENOISE_META + '>':     // meta->, end of history
+      case LINENOISE_PAGE_DOWN_KEY:  // Page Down, end of history
         killRing.lastAction = KillRing::actionOther;
         // if not already recalling, add the current line to the history list so
         // we don't
@@ -2965,7 +2981,7 @@ int InputBuffer::getInputLine(PromptBase& pi) {
         }
         if (historyLen > 1) {
           historyIndex =
-              (c == META + '<' || c == PAGE_UP_KEY) ? 0 : historyLen - 1;
+              (c == LINENOISE_META + '<' || c == LINENOISE_PAGE_UP_KEY) ? 0 : historyLen - 1;
           historyPreviousIndex = -2;
           historyRecallMostRecent = true;
           size_t ucharCount = 0;
@@ -2979,7 +2995,7 @@ int InputBuffer::getInputLine(PromptBase& pi) {
       default:
         killRing.lastAction = KillRing::actionOther;
         historyRecallMostRecent = false;
-        if (c & (META | CTRL)) {  // beep on unknown Ctrl and/or Meta keys
+        if (c & (LINENOISE_META | LINENOISE_CTRL)) {  // beep on unknown Ctrl and/or Meta keys
           beep();
           break;
         }
@@ -2989,12 +3005,17 @@ int InputBuffer::getInputLine(PromptBase& pi) {
             break;
           }
           if (len == pos) {  // at end of buffer
+            int prev = pos > 0 ? buf32[pos - 1] : 0;
             buf32[pos] = c;
             ++pos;
             ++len;
             buf32[len] = '\0';
             int inputLen = calculateColumnPosition(buf32, len);
-            if (pi.promptIndentation + inputLen < pi.promptScreenColumns) {
+            if (pi.promptIndentation + inputLen < pi.promptScreenColumns &&
+                !(c == '{' || c == '[' || c == '(' ||
+                  c == ')' || c == ']' || c == '}') &&
+                !(prev == '{' || prev == '[' || prev == '(' ||
+                  prev == ')' || prev == ']' || prev == '}')) {
               if (inputLen > pi.promptPreviousInputLen)
                 pi.promptPreviousInputLen = inputLen;
               /* Avoid a full update of the line in the
@@ -3098,10 +3119,9 @@ void linenoisePreloadBuffer(const char* preloadText) {
  *
  * @param prompt text of prompt to display to the user
  * @return       the returned string belongs to the caller on return and must be
- * freed to prevent
- *               memory leaks
+ * freed to prevent memory leaks
  */
-char* linenoise(const char* prompt) {
+char* linenoise(const char* prompt, int newline, int displayEmpty) {
 #ifndef _WIN32
   gotResize = false;
 #endif
@@ -3142,9 +3162,11 @@ char* linenoise(const char* prompt) {
         ib.preloadBuffer(preloadedBufferContents.c_str());
         preloadedBufferContents.clear();
       }
-      int count = ib.getInputLine(pi);
+      int count = ib.getInputLine(pi, displayEmpty);
       disableRawMode();
-      printf("\n");
+      if (newline) {
+        printf("\n");
+      }
       if (count == -1) {
         return NULL;
       }
@@ -3177,6 +3199,14 @@ void linenoiseSetCompletionCallback(linenoiseCompletionCallback* fn) {
 
 void linenoiseAddCompletion(linenoiseCompletions* lc, const char* str) {
   lc->completionStrings.push_back(Utf32String(str));
+}
+
+void linenoiseSetKeyCallback(linenoiseKeyCallback* fn) {
+  keyCallback = fn;
+}
+
+void linenoiseQueueKey(linenoiseKeyQueue* queue, char32_t key) {
+  queue->queue.push_back(key);
 }
 
 int linenoiseHistoryAdd(const char* line) {

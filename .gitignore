@@ -11,3 +11,4 @@ liblinenoise.a
 history.txt
 *.o
 *~
+.clang_complete
